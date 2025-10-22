@@ -5,23 +5,37 @@
  * Fetches all posts and pages from WP REST API for multiple sites
  */
 
+ /*
+
+47 = https://legalaidlearning.justice.gov.uk
+5 = https://ccrc.gov.uk
+52 = https://pecs-contract-guide.service.justice.gov.uk
+// messy
+14 = https://ppo.gov.uk
+54 = https://lawcom.gov.uk
+
+*/
+
 // ============================================
 // CONFIGURATION - Edit these values
 // ============================================
 $BASE_URL = 'https://hale.docker';
-$SITE_IDS = [1, 2, 3]; // Add your site IDs here
+$SITE_IDS = [5, 47, 52]; // Add your site IDs here
 $OUTPUT_DIR = 'wordpress_content';
+$ENV = 'PROD';
 // ============================================
 
 class WordPressMultisiteScraper
 {
     private $baseUrl;
     private $outputDir;
+    private $env;
 
-    public function __construct($baseUrl, $outputDir = 'wordpress_content')
+    public function __construct($baseUrl, $outputDir = 'wordpress_content', $env = 'DEV')
     {
         $this->baseUrl = rtrim($baseUrl, '/');
         $this->outputDir = $outputDir;
+        $this->env = $env;
     }
 
     /**
@@ -45,13 +59,16 @@ class WordPressMultisiteScraper
     /**
      * Fetch all items from a paginated endpoint
      */
-    private function fetchAllItems($endpoint, $siteId)
+    private function fetchAllItems($endpoint, $siteId, $baseURL = '')
     {
         $items = [];
         $page = 1;
         $perPage = 100;
 
-        while (true) {
+        if(!empty($baseURL)){
+            $url = "{$baseURL}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}&page={$page}";
+        }
+        else {
             // Build URL for multisite
             if ($siteId === 1) {
                 // Main site
@@ -60,7 +77,7 @@ class WordPressMultisiteScraper
                 // Subsite
                 $url = "{$this->baseUrl}/site-{$siteId}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}&page={$page}";
             }
-
+        }
             echo "Fetching {$endpoint} page {$page} from site {$siteId}...\n";
 
             $ch = curl_init();
@@ -79,7 +96,7 @@ class WordPressMultisiteScraper
             if (curl_errno($ch)) {
                 echo "Error: " . curl_error($ch) . "\n";
                 curl_close($ch);
-                break;
+                return $items;
             }
 
             curl_close($ch);
@@ -93,29 +110,23 @@ class WordPressMultisiteScraper
                 if ($httpCode === 404) {
                     echo "Site {$siteId} may not exist or REST API is not accessible\n";
                 }
-                break;
+                return $items;
             }
 
+        
             $data = json_decode($body, true);
 
             if (empty($data)) {
-                break;
+                return $items;
             }
 
             $items = array_merge($items, $data);
             echo "Fetched " . count($data) . " {$endpoint}\n";
 
             // Check for total pages in headers
-            preg_match('/X-WP-TotalPages: (\d+)/', $headers, $matches);
-            $totalPages = isset($matches[1]) ? (int)$matches[1] : $page;
+            //preg_match('/X-WP-TotalPages: (\d+)/', $headers, $matches);
+            //$totalPages = isset($matches[1]) ? (int)$matches[1] : $page;
 
-            if ($page >= $totalPages) {
-                break;
-            }
-
-            $page++;
-            usleep(500000); // 0.5 second delay
-        }
 
         return $items;
     }
@@ -171,7 +182,7 @@ class WordPressMultisiteScraper
     /**
      * Scrape a single site
      */
-    private function scrapeSite($siteId)
+    private function scrapeSite($siteId, $baseURL = '')
     {
         echo "\n" . str_repeat("=", 60) . "\n";
         echo "Processing Site ID: {$siteId}\n";
@@ -179,19 +190,21 @@ class WordPressMultisiteScraper
 
         // Fetch posts
         echo "=== Fetching Posts from Site {$siteId} ===\n";
-        $posts = $this->fetchAllItems('posts', $siteId);
+        $posts = $this->fetchAllItems('posts', $siteId, $baseURL);
         echo "Total posts fetched: " . count($posts) . "\n\n";
 
         // Fetch pages
         echo "=== Fetching Pages from Site {$siteId} ===\n";
-        $pages = $this->fetchAllItems('pages', $siteId);
+        $pages = $this->fetchAllItems('pages', $siteId, $baseURL);
         echo "Total pages fetched: " . count($pages) . "\n\n";
 
+        /*
         // Save content
         if (!empty($posts)) {
             echo "=== Saving Posts from Site {$siteId} ===\n";
             $this->saveContent($posts, 'posts', $siteId);
         }
+        */
 
         if (!empty($pages)) {
             echo "\n=== Saving Pages from Site {$siteId} ===\n";
@@ -220,8 +233,24 @@ class WordPressMultisiteScraper
 
         $summary = [];
 
-        foreach ($siteIds as $siteId) {
-            $summary[$siteId] = $this->scrapeSite($siteId);
+        if($this->env == 'PROD'){
+            $site_list = $this->getSiteList();
+
+            foreach ($site_list as $site) {
+              
+                $siteId = (int) $site["blogID"];
+
+               if(in_array($siteId, $siteIds)){
+                $summary[$siteId] = $this->scrapeSite($siteId, $site["url"]);
+               }
+               
+            }
+        }
+        else {
+            //Local
+            foreach ($siteIds as $siteId) {
+                $summary[$siteId] = $this->scrapeSite($siteId);
+            }
         }
 
         // Print summary
@@ -241,6 +270,88 @@ class WordPressMultisiteScraper
         echo "\nTotal: {$totalPosts} posts and {$totalPages} pages across " . count($siteIds) . " sites\n";
         echo "Saved to: {$this->outputDir}\n";
     }
+
+    public function getSiteList()
+    {
+
+        /**
+         * Definitive site list that have production domains.
+         * This site list is pulled from our Prod site list API.
+         *
+         * The API contains a list of sites with their respective information.
+         *
+         * - 'blogID': The ID of the blog.
+         * - 'domain': The domain of the site.
+         * - 'slug': The unique given directory path of the site.
+         */
+
+        // Initialize a cURL session
+        $ch = curl_init();
+
+        // Set URL we want
+        curl_setopt($ch, CURLOPT_URL, 'https://websitebuilder.service.justice.gov.uk/wp-json/hc-rest/v1/sites/domain');
+
+        // Output as a string not to browser
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+        // Set a timeout
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+        // Follow redirects (if ever useful)
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+
+        // Make sure to verify SSL certs
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+
+        // Optional but useful additions
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);     // Timeout for connection phase only
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);           // Limit number of redirects
+
+        // Execute response
+        $response = curl_exec($ch);
+
+        // Check for cURL errors
+        // curl_errno() returns the error number (0 = no error)
+        if (curl_errno($ch)) {
+            echo "cURL Error Number: " . curl_errno($ch) . "\n";
+            echo "cURL Error Message: " . curl_error($ch) . "\n";
+            $data = null;
+        } else {
+            // Get HTTP response code
+            // Server responded with 200 OK, 404 Not Found, etc.
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+            // Useful debug info about the request
+            #$info = curl_getinfo($ch);
+            #echo "HTTP Code: " . $httpCode . "\n";
+            #echo "Content Type: " . $info['content_type'] . "\n";
+            #echo "Total Time: " . $info['total_time'] . " seconds\n";
+            #echo "Download Size: " . $info['size_download'] . " bytes\n";
+
+            if ($httpCode === 200) {
+                // Process successful response
+                $data = json_decode($response, true);
+
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    echo "JSON Decode Error: " . json_last_error_msg() . "\n";
+                    $data = null;
+                }
+            } else {
+                echo "HTTP Error: Received status code $httpCode\n";
+                $data = null;
+            }
+        }
+
+        // Always close the cURL handle to free up resources
+        curl_close($ch);
+
+        if ($data !== null) {
+            return $data;
+        }
+        else {
+            return [];
+        }
+    }
 }
 
 // Main execution
@@ -249,5 +360,5 @@ if (php_sapi_name() !== 'cli') {
 }
 
 // Run scraper
-$scraper = new WordPressMultisiteScraper($BASE_URL, $OUTPUT_DIR);
+$scraper = new WordPressMultisiteScraper($BASE_URL, $OUTPUT_DIR, $ENV);
 $scraper->run($SITE_IDS);
