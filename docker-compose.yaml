@@ -1,7 +1,7 @@
 services:
-  scraper:
+  data_etl_tool:
     build: .
-    container_name: chunk_norris_data_etl
+    container_name: cn_data_etl
     volumes:
       - ./scraper:/app:cached
     working_dir: /app
