@@ -5,7 +5,7 @@
  * Fetches all posts and pages from WP REST API for multiple sites
  */
 
- /*
+/*
 
 47 = https://legalaidlearning.justice.gov.uk
 5 = https://ccrc.gov.uk
@@ -19,10 +19,11 @@
 // ============================================
 // CONFIGURATION - Edit these values
 // ============================================
-$BASE_URL = 'https://hale.docker';
-$SITE_IDS = [5]; // Add your site IDs here
-$OUTPUT_DIR = 'wordpress_content';
-$ENV = 'PROD';
+$BASE_URL   = getenv('PUBLIC_BASE_URL') ?: 'https://hale.docker';
+$SITE_IDS   = getenv('SITE_IDS') ? array_map('intval', explode(',', getenv('SITE_IDS'))) : [5];
+$OUTPUT_DIR = getenv('OUTPUT_DIR') ?: 'wordpress_content';
+$ENV        = getenv('ENV') ?: 'PROD';
+
 // ============================================
 
 class WordPressMultisiteScraper
@@ -65,10 +66,9 @@ class WordPressMultisiteScraper
         $page = 1;
         $perPage = 100; //Max is 100 items per pad need to loop round other pages
 
-        if(!empty($baseURL)){
+        if (!empty($baseURL)) {
             $apiURL = "{$baseURL}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
-        }
-        else {
+        } else {
             // Build URL for multisite
             if ($siteId === 1) {
                 // Main site
@@ -80,14 +80,14 @@ class WordPressMultisiteScraper
         }
 
         $currentPage = "&page={$page}";
-        
+
         echo "Fetching {$endpoint} page {$page} from site {$siteId}...\n";
 
         $apiResponse = $this->fetchFromApi($apiURL . $currentPage);
 
         $items = array_merge($items, $apiResponse['data']);
         echo "Fetched " . count($apiResponse['data']) . " {$endpoint}\n";
-        
+
         // Check for total pages in headers
         preg_match('/X-WP-TotalPages: (\d+)/i', $apiResponse['headers'], $matches);
 
@@ -95,8 +95,8 @@ class WordPressMultisiteScraper
 
         echo "Endpoint Pages -  $totalPages pages found for {$endpoint} endpoint from site {$siteId}...\n";
 
-        if($totalPages > 1){
-            
+        if ($totalPages > 1) {
+
             for ($page = 2; $page <= $totalPages; $page++) {
                 echo "Fetching {$endpoint} endpoint page {$page} from site {$siteId}...\n";
 
@@ -157,7 +157,7 @@ class WordPressMultisiteScraper
         }
 
         foreach ($siteTaxonomies as $taxonomy) {
-            if(in_array($contentType, $taxonomy['types'])){
+            if (in_array($contentType, $taxonomy['types'])) {
                 $contentTypeTaxonomies[] = $taxonomy;
             }
         }
@@ -188,33 +188,33 @@ class WordPressMultisiteScraper
 
             //For each taxonomy that for the current post type
             foreach ($contentTypeTaxonomies as $taxonomy) {
-                
-                if(array_key_exists($taxonomy['slug'], $item) && !empty($item[$taxonomy['slug']])){
-                   
+
+                if (array_key_exists($taxonomy['slug'], $item) && !empty($item[$taxonomy['slug']])) {
+
                     $term_names = [];
                     $term_ids = $item[$taxonomy['slug']];
 
                     foreach ($term_ids as $term_id) {
-                        if(array_key_exists($term_id, $taxonomy['terms'])){
+                        if (array_key_exists($term_id, $taxonomy['terms'])) {
                             $term_names[] = $taxonomy['terms'][$term_id]['name'];
                         }
                     }
 
-                    if(!empty($term_names)){
+                    if (!empty($term_names)) {
                         $fullText .= $taxonomy['name'] . ": \n\n";
                         $fullText .= implode(", ", $term_names) . " \n\n";
                     }
 
                 }
-               
+
             }
 
             if (!empty($excerpt)) {
                 $fullText .= "Excerpt: {$excerpt}\n\n";
             }
 
-            if(array_key_exists('post_meta', $item) && !empty($item['post_meta'])){
-                if(array_key_exists('summary', $item['post_meta']) && !empty($item['post_meta']['summary'])){
+            if (array_key_exists('post_meta', $item) && !empty($item['post_meta'])) {
+                if (array_key_exists('summary', $item['post_meta']) && !empty($item['post_meta']['summary'])) {
                     $fullText .= "Summary: {$item['post_meta']['summary']}\n\n";
                 }
             }
@@ -236,7 +236,7 @@ class WordPressMultisiteScraper
      */
     private function scrapeSite($siteId, $baseURL = '')
     {
-        
+
         $scrapeSummary = [];
 
         echo "\n" . str_repeat("=", 60) . "\n";
@@ -288,21 +288,20 @@ class WordPressMultisiteScraper
 
         $summary = [];
 
-        if($this->env == 'PROD'){
+        if ($this->env == 'PROD') {
             $site_list = $this->getSiteList();
 
             foreach ($site_list as $site) {
-              
+
                 $siteId = (int) $site["blogID"];
 
-               if(in_array($siteId, $siteIds)){
+                if (in_array($siteId, $siteIds)) {
 
                     $summary[$siteId] = $this->scrapeSite($siteId, $site["url"]);
-               }
-               
+                }
+
             }
-        }
-        else {
+        } else {
             //Local
             foreach ($siteIds as $siteId) {
                 $summary[$siteId] = $this->scrapeSite($siteId);
@@ -319,7 +318,7 @@ class WordPressMultisiteScraper
             $summary = "Site {$siteId}: ";
             $count = 0;
             foreach ($siteSummary as $postType) {
-                if($count > 0){
+                if ($count > 0) {
                     $summary .= ", ";
                 }
                 $summary .= $postType['itemCount'] . " " . $postType['postTypeName'];
@@ -330,7 +329,7 @@ class WordPressMultisiteScraper
             //$totalPages += $counts['pages'];
         }
 
-       // echo "\nTotal: {$totalPosts} posts and {$totalPages} pages across " . count($siteIds) . " sites\n";
+        // echo "\nTotal: {$totalPosts} posts and {$totalPages} pages across " . count($siteIds) . " sites\n";
         echo "Saved to: {$this->outputDir}\n";
     }
 
@@ -421,34 +420,34 @@ class WordPressMultisiteScraper
         if ($data !== null) {
             $apiResponse['data'] = $data;
         }
-        
+
         return $apiResponse;
     }
 
-    private function getSiteTaxonomies($baseURL='')
+    private function getSiteTaxonomies($baseURL = '')
     {
 
         $siteTaxonomies = [];
 
         $apiURL = $baseURL . '/wp-json/wp/v2/taxonomies';
-       
+
         $apiResponse = $this->fetchFromApi($apiURL);
         $fetchedTaxonomies = $apiResponse['data'];
 
 
         // Quesiton - Nav menu breaks as it requires login - how do we determine this?
         $excludedTaxonomies = [
-            'nav_menu', 
-            'wp_pattern_category', 
+            'nav_menu',
+            'wp_pattern_category',
         ];
 
         foreach ($fetchedTaxonomies as $taxonomy) {
 
-            if(!in_array($taxonomy['slug'], $excludedTaxonomies)){
+            if (!in_array($taxonomy['slug'], $excludedTaxonomies)) {
                 $terms = [];
 
                 $apiURL = $baseURL . '/wp-json/wp/v2/' . $taxonomy['rest_base'];
-        
+
                 $apiResponse = $this->fetchFromApi($apiURL);
                 $fetchedTerms = $apiResponse['data'];
 
@@ -460,27 +459,27 @@ class WordPressMultisiteScraper
                 $siteTaxonomies[] = $taxonomy;
             }
         }
-    
+
         return $siteTaxonomies;
     }
 
-    private function getSitePostTypes($baseURL='')
+    private function getSitePostTypes($baseURL = '')
     {
 
         $postTypes = [];
 
         $apiURL = $baseURL . '/wp-json/wp/v2/types';
-       
+
         $apiResponse = $this->fetchFromApi($apiURL);
         $fetchedPostTypes = $apiResponse['data'];
 
         // Question - could we filter this in another way
         $excludedPostTypes = [
-            'attachment', 
-            'nav_menu_item', 
-            'wp_block', 
-            'wp_template', 
-            'wp_template_part', 
+            'attachment',
+            'nav_menu_item',
+            'wp_block',
+            'wp_template',
+            'wp_template_part',
             'wp_global_styles',
             'wp_navigation',
             'wp_font_family',
@@ -490,7 +489,7 @@ class WordPressMultisiteScraper
         foreach ($fetchedPostTypes as $postType) {
 
             //Exclude core Post types
-            if(!in_array($postType['slug'], $excludedPostTypes)){
+            if (!in_array($postType['slug'], $excludedPostTypes)) {
                 //Question - Decide if we want all fields or just pull out name, slug, rest_base
                 // do we add check for rest_base
                 $postTypes[] = $postType;
@@ -519,7 +518,7 @@ class WordPressMultisiteScraper
         $apiResponse = $this->fetchFromApi($apiURL);
 
         return $apiResponse['data'];
-       
+
     }
 }
 

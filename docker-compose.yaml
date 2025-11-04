@@ -1,0 +1,9 @@
+services:
+  scraper:
+    build: .
+    container_name: chunk_norris_data_etl
+    volumes:
+      - ./scraper:/app:cached
+    working_dir: /app
+    command: php run.php
+
