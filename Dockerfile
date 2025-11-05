@@ -15,13 +15,10 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 # Set working directory inside container
 WORKDIR /app
 
-# Copy composer.json first for better layer caching
-COPY composer.json composer.lock* ./
+# Install AWS SDK for PHP directly
+RUN composer require aws/aws-sdk-php:^3.0 --no-interaction --no-progress --optimize-autoloader
 
-# Install PHP dependencies (AWS SDK)
-RUN composer install --no-dev --no-interaction --no-progress --optimize-autoloader
-
-# Copy the rest of the scraper code
+# Copy the scraper code
 COPY scraper/ /app/
 
 # Create non-root user
