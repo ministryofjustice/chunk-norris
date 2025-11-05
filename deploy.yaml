@@ -5,11 +5,15 @@ metadata:
   namespace: website-builder-assistant-dev
 spec:
   schedule: "0 */1 * * *" # Run every hour
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
+      backoffLimit: 3  # Retry limit - correct placement
       template:
         spec:
           serviceAccountName: website-builder-assistant-dev-service
+          restartPolicy: OnFailure
           containers:
             - name: chunk-norris-cron
               image: 754256621582.dkr.ecr.eu-west-2.amazonaws.com/jotw-content-devs/website-builder-assistant-dev-chunk-norris-ecr:latest
@@ -31,7 +35,7 @@ spec:
                 - name: S3_REGION
                   value: "eu-west-2"
                 - name: S3_PREFIX
-                  value: "wordpress-content/"  # folder prefix in bucket
+                  value: "wordpress-content/"
               
               resources:
                 requests:
@@ -50,12 +54,3 @@ spec:
                 runAsUser: 1000
                 seccompProfile:
                   type: RuntimeDefault
-          
-          restartPolicy: OnFailure
-          
-          # Optional: Backoff limit for failed jobs
-          backoffLimit: 3
-  
-  # Optional: Keep last 3 successful and 1 failed job for debugging
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 1

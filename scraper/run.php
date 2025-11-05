@@ -1,20 +1,14 @@
 <?php
 
 /**
- * WordPress Multisite Content Scraper
- * Fetches all posts and pages from WP REST API for multiple sites
+ * WordPress Multisite Content Scraper with S3 Upload
+ * Fetches all posts and pages from WP REST API and uploads to S3
  */
 
-/*
+require 'vendor/autoload.php';
 
-47 = https://legalaidlearning.justice.gov.uk
-5 = https://ccrc.gov.uk
-52 = https://pecs-contract-guide.service.justice.gov.uk
-// messy
-14 = https://ppo.gov.uk
-54 = https://lawcom.gov.uk
-
-*/
+use Aws\S3\S3Client;
+use Aws\Exception\AwsException;
 
 // ============================================
 // CONFIGURATION - Edit these values
@@ -24,6 +18,11 @@ $SITE_IDS   = getenv('SITE_IDS') ? array_map('intval', explode(',', getenv('SITE
 $OUTPUT_DIR = getenv('OUTPUT_DIR') ?: 'wordpress_content';
 $ENV        = getenv('ENV') ?: 'PROD';
 
+// S3 Configuration
+$S3_BUCKET  = getenv('S3_BUCKET') ?: 'my-wordpress-content-bucket';
+$S3_REGION  = getenv('S3_REGION') ?: 'eu-west-2';
+$S3_PREFIX  = getenv('S3_PREFIX') ?: 'wordpress-scrapes/'; // Optional prefix/folder in bucket
+
 // ============================================
 
 class WordPressMultisiteScraper
@@ -31,12 +30,66 @@ class WordPressMultisiteScraper
     private $baseUrl;
     private $outputDir;
     private $env;
+    private $s3Client;
+    private $s3Bucket;
+    private $s3Prefix;
 
-    public function __construct($baseUrl, $outputDir = 'wordpress_content', $env = 'DEV')
+    public function __construct($baseUrl, $outputDir = 'wordpress_content', $env = 'DEV', $s3Config = null)
     {
         $this->baseUrl = rtrim($baseUrl, '/');
         $this->outputDir = $outputDir;
         $this->env = $env;
+
+        // Initialize S3 client if config provided
+        if ($s3Config) {
+            $this->s3Bucket = $s3Config['bucket'];
+            $this->s3Prefix = rtrim($s3Config['prefix'], '/') . '/';
+
+            // When running in K8s with IRSA, credentials are automatically provided
+            // via environment variables or instance metadata
+            $this->s3Client = new S3Client([
+                'version' => 'latest',
+                'region'  => $s3Config['region'],
+                // Credentials automatically loaded from:
+                // - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+                // - IAM role attached to service account (IRSA)
+                // - EKS Pod Identity
+            ]);
+
+            echo "S3 upload enabled - Bucket: {$this->s3Bucket}, Region: {$s3Config['region']}\n";
+        }
+    }
+
+    /**
+     * Upload file to S3
+     */
+    private function uploadToS3($content, $s3Key)
+    {
+        if (!$this->s3Client) {
+            echo "S3 client not initialized, skipping upload\n";
+            return false;
+        }
+
+        try {
+            $result = $this->s3Client->putObject([
+                'Bucket' => $this->s3Bucket,
+                'Key'    => $s3Key,
+                'Body'   => $content,
+                'ContentType' => 'text/plain',
+                // Optional: Add metadata
+                'Metadata' => [
+                    'uploaded-by' => 'wordpress-scraper',
+                    'timestamp' => date('c'),
+                ],
+            ]);
+
+            echo "✓ Uploaded to S3: s3://{$this->s3Bucket}/{$s3Key}\n";
+            return true;
+
+        } catch (AwsException $e) {
+            echo "✗ S3 Upload Error: " . $e->getMessage() . "\n";
+            return false;
+        }
     }
 
     /**
@@ -44,16 +97,10 @@ class WordPressMultisiteScraper
      */
     private function stripHtml($html)
     {
-        // Decode HTML entities
         $text = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
-
-        // Remove HTML tags
         $text = strip_tags($text);
-
-        // Clean up whitespace
         $text = preg_replace('/\s+/', ' ', $text);
         $text = trim($text);
-
         return $text;
     }
 
@@ -64,97 +111,83 @@ class WordPressMultisiteScraper
     {
         $items = [];
         $page = 1;
-        $perPage = 100; //Max is 100 items per pad need to loop round other pages
+        $perPage = 100;
 
         if (!empty($baseURL)) {
             $apiURL = "{$baseURL}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
         } else {
-            // Build URL for multisite
             if ($siteId === 1) {
-                // Main site
                 $apiURL = "{$this->baseUrl}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
             } else {
-                // Subsite
                 $apiURL = "{$this->baseUrl}/site-{$siteId}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
             }
         }
 
         $currentPage = "&page={$page}";
-
         echo "Fetching {$endpoint} page {$page} from site {$siteId}...\n";
 
         $apiResponse = $this->fetchFromApi($apiURL . $currentPage);
-
         $items = array_merge($items, $apiResponse['data']);
         echo "Fetched " . count($apiResponse['data']) . " {$endpoint}\n";
 
-        // Check for total pages in headers
         preg_match('/X-WP-TotalPages: (\d+)/i', $apiResponse['headers'], $matches);
-
         $totalPages = isset($matches[1]) ? (int)$matches[1] : $page;
 
-        echo "Endpoint Pages -  $totalPages pages found for {$endpoint} endpoint from site {$siteId}...\n";
+        echo "Endpoint Pages - $totalPages pages found for {$endpoint} endpoint from site {$siteId}...\n";
 
         if ($totalPages > 1) {
-
             for ($page = 2; $page <= $totalPages; $page++) {
                 echo "Fetching {$endpoint} endpoint page {$page} from site {$siteId}...\n";
-
                 $currentPage = "&page={$page}";
-
                 $apiResponse = $this->fetchFromApi($apiURL . $currentPage);
                 $items = array_merge($items, $apiResponse['data']);
             }
         }
 
-
         return $items;
     }
 
     /**
-     * Save raw content to text files
+     * Save raw content to S3 (or local if S3 not configured)
      */
     private function saveRawContent($item, $contentType, $siteId)
     {
-        $typeDir = "{$this->outputDir}/site-{$siteId}/raw/{$contentType}";
-
         $rawContent = '';
-
-        if (!is_dir($typeDir)) {
-            mkdir($typeDir, 0755, true);
-        }
 
         $rawContent .= isset($item['title']['rendered'])
                 ? '<h1>' . $item['title']['rendered'] . '</h1>'
                 : 'Untitled';
 
-
         $rawContent .= isset($item['content']['rendered'])
                 ? $item['content']['rendered']
                 : '';
 
-        // Create filename
         $slug = isset($item['slug']) ? $item['slug'] : "{$contentType}-{$item['id']}";
         $slug = preg_replace('/[^a-z0-9-_]/', '', strtolower($slug));
         $filename = "{$slug}.txt";
 
-        // Save to file
-        $filePath = "{$typeDir}/{$filename}";
-        file_put_contents($filePath, $rawContent);
+        // Upload to S3 or save locally
+        if ($this->s3Client) {
+            $s3Key = $this->s3Prefix . "site-{$siteId}/raw/{$contentType}/{$filename}";
+            $this->uploadToS3($rawContent, $s3Key);
+        } else {
+            // Fallback to local storage
+            $typeDir = "{$this->outputDir}/site-{$siteId}/raw/{$contentType}";
+            if (!is_dir($typeDir)) {
+                mkdir($typeDir, 0755, true);
+            }
+            $filePath = "{$typeDir}/{$filename}";
+            file_put_contents($filePath, $rawContent);
+            echo "Saved locally: {$filePath}\n";
+        }
     }
+
     /**
-     * Save content to text files
+     * Save content to S3 (or local if S3 not configured)
      */
     private function saveContent($items, $contentType, $siteId, $siteTaxonomies)
     {
-
         $contentTypeTaxonomies = [];
-
-        $typeDir = "{$this->outputDir}/site-{$siteId}/clean/{$contentType}";
-
-        if (!is_dir($typeDir)) {
-            mkdir($typeDir, 0755, true);
-        }
 
         foreach ($siteTaxonomies as $taxonomy) {
             if (in_array($contentType, $taxonomy['types'])) {
@@ -164,6 +197,7 @@ class WordPressMultisiteScraper
 
         foreach ($items as $item) {
             $this->saveRawContent($item, $contentType, $siteId);
+
             // Extract content
             $title = isset($item['title']['rendered'])
                 ? $this->stripHtml($item['title']['rendered'])
@@ -177,7 +211,6 @@ class WordPressMultisiteScraper
                 ? $this->stripHtml($item['excerpt']['rendered'])
                 : '';
 
-            // Create filename
             $slug = isset($item['slug']) ? $item['slug'] : "{$contentType}-{$item['id']}";
             $slug = preg_replace('/[^a-z0-9-_]/', '', strtolower($slug));
             $filename = "{$slug}.txt";
@@ -186,11 +219,8 @@ class WordPressMultisiteScraper
             $fullText = "Site ID: {$siteId}\n";
             $fullText .= "Title: {$title}\n\n";
 
-            //For each taxonomy that for the current post type
             foreach ($contentTypeTaxonomies as $taxonomy) {
-
                 if (array_key_exists($taxonomy['slug'], $item) && !empty($item[$taxonomy['slug']])) {
-
                     $term_names = [];
                     $term_ids = $item[$taxonomy['slug']];
 
@@ -204,9 +234,7 @@ class WordPressMultisiteScraper
                         $fullText .= $taxonomy['name'] . ": \n\n";
                         $fullText .= implode(", ", $term_names) . " \n\n";
                     }
-
                 }
-
             }
 
             if (!empty($excerpt)) {
@@ -221,13 +249,20 @@ class WordPressMultisiteScraper
 
             $fullText .= "Content:\n{$content}";
 
-
-
-            // Save to file
-            $filePath = "{$typeDir}/{$filename}";
-            file_put_contents($filePath, $fullText);
-
-            echo "Saved: {$filePath}\n";
+            // Upload to S3 or save locally
+            if ($this->s3Client) {
+                $s3Key = $this->s3Prefix . "site-{$siteId}/clean/{$contentType}/{$filename}";
+                $this->uploadToS3($fullText, $s3Key);
+            } else {
+                // Fallback to local storage
+                $typeDir = "{$this->outputDir}/site-{$siteId}/clean/{$contentType}";
+                if (!is_dir($typeDir)) {
+                    mkdir($typeDir, 0755, true);
+                }
+                $filePath = "{$typeDir}/{$filename}";
+                file_put_contents($filePath, $fullText);
+                echo "Saved locally: {$filePath}\n";
+            }
         }
     }
 
@@ -236,7 +271,6 @@ class WordPressMultisiteScraper
      */
     private function scrapeSite($siteId, $baseURL = '')
     {
-
         $scrapeSummary = [];
 
         echo "\n" . str_repeat("=", 60) . "\n";
@@ -244,12 +278,10 @@ class WordPressMultisiteScraper
         echo str_repeat("=", 60) . "\n\n";
 
         $sitePostTypes = $this->getSitePostTypes($baseURL);
-
-        // Question - getting for tax details - do we need?
         $siteTaxonomies = $this->getSiteTaxonomies($baseURL);
 
         foreach ($sitePostTypes as $postType) {
-            $postTypeName =  $postType['name'];
+            $postTypeName = $postType['name'];
             echo "=== Fetching {$postTypeName} from Site {$siteId} ===\n";
 
             $items = $this->fetchAllItems($postType['rest_base'], $siteId, $baseURL);
@@ -258,7 +290,6 @@ class WordPressMultisiteScraper
 
             if (!empty($items)) {
                 echo "=== Saving {$postTypeName} from Site {$siteId} ===\n";
-                //Question - do we use rest base or slug for folder - slug matches with taxonomies
                 $this->saveContent($items, $postType['slug'], $siteId, $siteTaxonomies);
             }
 
@@ -269,7 +300,6 @@ class WordPressMultisiteScraper
         }
 
         return $scrapeSummary;
-
     }
 
     /**
@@ -281,28 +311,19 @@ class WordPressMultisiteScraper
         echo "Output directory: {$this->outputDir}\n";
         echo "Target sites: " . implode(', ', $siteIds) . "\n";
 
-        // Create output directory
-        if (!is_dir($this->outputDir)) {
-            mkdir($this->outputDir, 0755, true);
-        }
-
         $summary = [];
 
         if ($this->env == 'PROD') {
             $site_list = $this->getSiteList();
 
             foreach ($site_list as $site) {
-
                 $siteId = (int) $site["blogID"];
 
                 if (in_array($siteId, $siteIds)) {
-
                     $summary[$siteId] = $this->scrapeSite($siteId, $site["url"]);
                 }
-
             }
         } else {
-            //Local
             foreach ($siteIds as $siteId) {
                 $summary[$siteId] = $this->scrapeSite($siteId);
             }
@@ -314,94 +335,53 @@ class WordPressMultisiteScraper
         echo str_repeat("=", 60) . "\n";
 
         foreach ($summary as $siteId => $siteSummary) {
-
-            $summary = "Site {$siteId}: ";
+            $summaryText = "Site {$siteId}: ";
             $count = 0;
             foreach ($siteSummary as $postType) {
                 if ($count > 0) {
-                    $summary .= ", ";
+                    $summaryText .= ", ";
                 }
-                $summary .= $postType['itemCount'] . " " . $postType['postTypeName'];
+                $summaryText .= $postType['itemCount'] . " " . $postType['postTypeName'];
                 $count++;
             }
-            echo $summary . "\n";
-            //$totalPosts += $counts['posts'];
-            //$totalPages += $counts['pages'];
+            echo $summaryText . "\n";
         }
 
-        // echo "\nTotal: {$totalPosts} posts and {$totalPages} pages across " . count($siteIds) . " sites\n";
-        echo "Saved to: {$this->outputDir}\n";
+        if ($this->s3Client) {
+            echo "\nFiles uploaded to: s3://{$this->s3Bucket}/{$this->s3Prefix}\n";
+        } else {
+            echo "\nFiles saved locally to: {$this->outputDir}\n";
+        }
     }
 
     private function fetchFromApi($apiURL)
     {
         $apiResponse = ['data' => [], 'headers' => ''];
-
-        /**
-         * Definitive site list that have production domains.
-         * This site list is pulled from our Prod site list API.
-         *
-         * The API contains a list of sites with their respective information.
-         *
-         * - 'blogID': The ID of the blog.
-         * - 'domain': The domain of the site.
-         * - 'slug': The unique given directory path of the site.
-         */
-
         $ch = curl_init();
 
-        // Set URL we want
         curl_setopt($ch, CURLOPT_URL, $apiURL);
-
-        // Output as a string not to browser
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-
-        // Set a timeout
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-
-        // Follow redirects (if ever useful)
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-
-        // Make sure to verify SSL certs
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        curl_setopt($ch, CURLOPT_HEADER, true);
 
-        // Optional but useful additions
-        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);     // Timeout for connection phase only
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);           // Limit number of redirects
-
-        curl_setopt($ch, CURLOPT_HEADER, true); // Do we want this as an option
-
-        // Execute response
         $response = curl_exec($ch);
 
-        // Check for cURL errors
-        // curl_errno() returns the error number (0 = no error)
         if (curl_errno($ch)) {
             echo "cURL Error Number: " . curl_errno($ch) . "\n";
             echo "cURL Error Message: " . curl_error($ch) . "\n";
             $data = null;
         } else {
-            // Get HTTP response code
-            // Server responded with 200 OK, 404 Not Found, etc.
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
 
-            // Useful debug info about the request
-            #$info = curl_getinfo($ch);
-            #echo "HTTP Code: " . $httpCode . "\n";
-            #echo "Content Type: " . $info['content_type'] . "\n";
-            #echo "Total Time: " . $info['total_time'] . " seconds\n";
-            #echo "Download Size: " . $info['size_download'] . " bytes\n";
-
             if ($httpCode === 200) {
-                // Process successful response
-
-                // Parse headers and body
                 $headers = substr($response, 0, $headerSize);
                 $body = substr($response, $headerSize);
-
                 $apiResponse['headers'] = $headers;
-
                 $data = json_decode($body, true);
 
                 if (json_last_error() !== JSON_ERROR_NONE) {
@@ -414,7 +394,6 @@ class WordPressMultisiteScraper
             }
         }
 
-        // Always close the cURL handle to free up resources
         curl_close($ch);
 
         if ($data !== null) {
@@ -426,28 +405,17 @@ class WordPressMultisiteScraper
 
     private function getSiteTaxonomies($baseURL = '')
     {
-
         $siteTaxonomies = [];
-
         $apiURL = $baseURL . '/wp-json/wp/v2/taxonomies';
-
         $apiResponse = $this->fetchFromApi($apiURL);
         $fetchedTaxonomies = $apiResponse['data'];
 
-
-        // Quesiton - Nav menu breaks as it requires login - how do we determine this?
-        $excludedTaxonomies = [
-            'nav_menu',
-            'wp_pattern_category',
-        ];
+        $excludedTaxonomies = ['nav_menu', 'wp_pattern_category'];
 
         foreach ($fetchedTaxonomies as $taxonomy) {
-
             if (!in_array($taxonomy['slug'], $excludedTaxonomies)) {
                 $terms = [];
-
                 $apiURL = $baseURL . '/wp-json/wp/v2/' . $taxonomy['rest_base'];
-
                 $apiResponse = $this->fetchFromApi($apiURL);
                 $fetchedTerms = $apiResponse['data'];
 
@@ -465,33 +433,19 @@ class WordPressMultisiteScraper
 
     private function getSitePostTypes($baseURL = '')
     {
-
         $postTypes = [];
-
         $apiURL = $baseURL . '/wp-json/wp/v2/types';
-
         $apiResponse = $this->fetchFromApi($apiURL);
         $fetchedPostTypes = $apiResponse['data'];
 
-        // Question - could we filter this in another way
         $excludedPostTypes = [
-            'attachment',
-            'nav_menu_item',
-            'wp_block',
-            'wp_template',
-            'wp_template_part',
-            'wp_global_styles',
-            'wp_navigation',
-            'wp_font_family',
-            'wp_font_face'
+            'attachment', 'nav_menu_item', 'wp_block', 'wp_template',
+            'wp_template_part', 'wp_global_styles', 'wp_navigation',
+            'wp_font_family', 'wp_font_face'
         ];
 
         foreach ($fetchedPostTypes as $postType) {
-
-            //Exclude core Post types
             if (!in_array($postType['slug'], $excludedPostTypes)) {
-                //Question - Decide if we want all fields or just pull out name, slug, rest_base
-                // do we add check for rest_base
                 $postTypes[] = $postType;
             }
         }
@@ -499,26 +453,11 @@ class WordPressMultisiteScraper
         return $postTypes;
     }
 
-
     private function getSiteList()
     {
-
-        /**
-         * Definitive site list that have production domains.
-         * This site list is pulled from our Prod site list API.
-         *
-         * The API contains a list of sites with their respective information.
-         *
-         * - 'blogID': The ID of the blog.
-         * - 'domain': The domain of the site.
-         * - 'slug': The unique given directory path of the site.
-         */
-
         $apiURL = 'https://websitebuilder.service.justice.gov.uk/wp-json/hc-rest/v1/sites/domain';
         $apiResponse = $this->fetchFromApi($apiURL);
-
         return $apiResponse['data'];
-
     }
 }
 
@@ -527,6 +466,13 @@ if (php_sapi_name() !== 'cli') {
     die("This script must be run from the command line.\n");
 }
 
+// Configure S3 (set to null to disable S3 and use local storage)
+$s3Config = [
+    'bucket' => $S3_BUCKET,
+    'region' => $S3_REGION,
+    'prefix' => $S3_PREFIX,
+];
+
 // Run scraper
-$scraper = new WordPressMultisiteScraper($BASE_URL, $OUTPUT_DIR, $ENV);
+$scraper = new WordPressMultisiteScraper($BASE_URL, $OUTPUT_DIR, $ENV, $s3Config);
 $scraper->run($SITE_IDS);
