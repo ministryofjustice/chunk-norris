@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: chunk-norris-cron
+  namespace: website-builder-assistant-dev
+spec:
+  schedule: "0 */1 * * *" # Run every hour
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: website-builder-assistant-dev-service
+          containers:
+            - name: chunk-norris-cron
+              image: 754256621582.dkr.ecr.eu-west-2.amazonaws.com/jotw-content-devs/website-builder-assistant-dev-chunk-norris-ecr:latest
+              imagePullPolicy: Always
+              env:
+                - name: PUBLIC_API_BASE_URL
+                  value: "https://websitebuilder.service.justice.gov.uk"
+                - name: SITE_IDS
+                  value: "1"
+                - name: OUTPUT_DIR
+                  value: "wordpress_content"
+                - name: ENV
+                  value: "PROD"
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                runAsNonRoot: true
+                seccompProfile:
+                  type: RuntimeDefault
+          restartPolicy: OnFailure
+
