@@ -3,70 +3,96 @@
 /**
  * WordPress Multisite Content Scraper with S3 Upload
  * Fetches all posts and pages from WP REST API and uploads to S3
+ * Fully debugged to show API responses, item counts, and content lengths.
  */
 
-require 'vendor/autoload.php';
+// --------------------------------------------
+// ENVIRONMENT
+// --------------------------------------------
+$ENV = getenv('ENV') ?: 'prod';
+$ENV = strtolower(trim($ENV));
 
-use Aws\S3\S3Client;
-use Aws\Exception\AwsException;
+if ($ENV !== 'local') {
+    require 'vendor/autoload.php';
+}
 
-// ============================================
-// CONFIGURATION - Edit these values
-// ============================================
+// --------------------------------------------
+// CONFIGURATION
+// --------------------------------------------
 $BASE_URL   = getenv('PUBLIC_BASE_URL') ?: 'https://hale.docker';
-$SITE_IDS   = getenv('SITE_IDS') ? array_map('intval', explode(',', getenv('SITE_IDS'))) : [5];
-$OUTPUT_DIR = getenv('OUTPUT_DIR') ?: 'wordpress_content';
-$ENV        = getenv('ENV') ?: 'PROD';
+$SITE_IDS   = getenv('SITE_IDS') ? array_map('intval', explode(',', getenv('SITE_IDS'))) : [1];
+$OUTPUT_DIR = getenv('OUTPUT_DIR') ?: 'wordpress-content';
 
-// S3 Configuration
-$S3_BUCKET  = getenv('S3_BUCKET') ?: 'my-wordpress-content-bucket';
+$S3_BUCKET  = getenv('S3_BUCKET') ?: '';
 $S3_REGION  = getenv('S3_REGION') ?: 'eu-west-2';
-$S3_PREFIX  = getenv('S3_PREFIX') ?: 'wordpress-scrapes/'; // Optional prefix/folder in bucket
+$S3_PREFIX  = getenv('S3_PREFIX') ?: 'wordpress-content/';
+
 
 // ============================================
-
+// SCRAPER CLASS
+// ============================================
 class WordPressMultisiteScraper
 {
     private $baseUrl;
     private $outputDir;
     private $env;
-    private $s3Client;
+    private $s3Client = null;
     private $s3Bucket;
     private $s3Prefix;
+    private $uploadFailures = [];
 
-    public function __construct($baseUrl, $outputDir = 'wordpress_content', $env = 'DEV', $s3Config = null)
+    public function __construct($baseUrl, $outputDir, $env, $s3Config = null)
     {
         $this->baseUrl = rtrim($baseUrl, '/');
         $this->outputDir = $outputDir;
-        $this->env = $env;
+        $this->env = strtolower(trim($env));
 
-        // Initialize S3 client if config provided
-        if ($s3Config) {
+        echo "Environment: {$this->env}\n";
+
+        if ($this->env !== 'local' && $s3Config && !empty($s3Config['bucket'])) {
             $this->s3Bucket = $s3Config['bucket'];
             $this->s3Prefix = rtrim($s3Config['prefix'], '/') . '/';
 
-            // When running in K8s with IRSA, credentials are automatically provided
-            // via environment variables or instance metadata
-            $this->s3Client = new S3Client([
-                'version' => 'latest',
-                'region'  => $s3Config['region'],
-                // Credentials automatically loaded from:
-                // - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-                // - IAM role attached to service account (IRSA)
-                // - EKS Pod Identity
-            ]);
+            try {
+                $this->s3Client = new \Aws\S3\S3Client([
+                    'version' => 'latest',
+                    'region'  => $s3Config['region'],
+                ]);
 
-            echo "S3 upload enabled - Bucket: {$this->s3Bucket}, Region: {$s3Config['region']}\n";
+                echo "✓ S3 upload enabled\n";
+                echo "  Bucket: {$this->s3Bucket}\n";
+                echo "  Region: {$s3Config['region']}\n";
+                echo "  Prefix: {$this->s3Prefix}\n";
+
+                echo "  Testing S3 connectivity...\n";
+                try {
+                    $this->s3Client->headBucket(['Bucket' => $this->s3Bucket]);
+                    echo "  ✓ S3 bucket accessible\n";
+                } catch (Exception $e) {
+                    echo "  ✗ WARNING: Cannot access S3 bucket: " . $e->getMessage() . "\n";
+                }
+
+            } catch (Exception $e) {
+                echo "✗ Failed to initialize S3 client: " . $e->getMessage() . "\n";
+                $this->s3Client = null;
+            }
+        } else {
+            echo "✓ Local mode - saving files to disk\n";
+            echo "  Output directory: {$this->outputDir}\n";
+            if (!is_dir($this->outputDir)) {
+                mkdir($this->outputDir, 0755, true);
+            }
         }
     }
 
-    /**
-     * Upload file to S3
-     */
     private function uploadToS3($content, $s3Key)
     {
         if (!$this->s3Client) {
-            echo "S3 client not initialized, skipping upload\n";
+            return false;
+        }
+
+        if (empty(trim($content))) {
+            echo "Skipping upload for empty content: {$s3Key}\n";
             return false;
         }
 
@@ -76,403 +102,225 @@ class WordPressMultisiteScraper
                 'Key'    => $s3Key,
                 'Body'   => $content,
                 'ContentType' => 'text/plain',
-                // Optional: Add metadata
                 'Metadata' => [
-                    'uploaded-by' => 'wordpress-scraper',
+                    'uploaded-by' => 'chunk-norris',
                     'timestamp' => date('c'),
                 ],
             ]);
 
-            echo "✓ Uploaded to S3: s3://{$this->s3Bucket}/{$s3Key}\n";
+            $etag = $result->get('ETag') ?? 'unknown';
+            echo "✓ Uploaded to S3: s3://{$this->s3Bucket}/{$s3Key} (ETag: {$etag})\n";
             return true;
 
-        } catch (AwsException $e) {
-            echo "✗ S3 Upload Error: " . $e->getMessage() . "\n";
+        } catch (\Aws\S3\Exception\S3Exception $e) {
+            echo "✗ S3 Exception: " . $e->getAwsErrorMessage() . "\n  Key: {$s3Key}\n";
+            $this->uploadFailures[] = $s3Key;
+            return false;
+
+        } catch (Exception $e) {
+            echo "✗ Upload Error: " . $e->getMessage() . "\n  Key: {$s3Key}\n";
+            $this->uploadFailures[] = $s3Key;
             return false;
         }
     }
 
-    /**
-     * Strip HTML tags and clean up text
-     */
     private function stripHtml($html)
     {
         $text = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
         $text = strip_tags($text);
         $text = preg_replace('/\s+/', ' ', $text);
-        $text = trim($text);
-        return $text;
-    }
-
-    /**
-     * Fetch all items from a paginated endpoint
-     */
-    private function fetchAllItems($endpoint, $siteId, $baseURL = '')
-    {
-        $items = [];
-        $page = 1;
-        $perPage = 100;
-
-        if (!empty($baseURL)) {
-            $apiURL = "{$baseURL}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
-        } else {
-            if ($siteId === 1) {
-                $apiURL = "{$this->baseUrl}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
-            } else {
-                $apiURL = "{$this->baseUrl}/site-{$siteId}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
-            }
-        }
-
-        $currentPage = "&page={$page}";
-        echo "Fetching {$endpoint} page {$page} from site {$siteId}...\n";
-
-        $apiResponse = $this->fetchFromApi($apiURL . $currentPage);
-        $items = array_merge($items, $apiResponse['data']);
-        echo "Fetched " . count($apiResponse['data']) . " {$endpoint}\n";
-
-        preg_match('/X-WP-TotalPages: (\d+)/i', $apiResponse['headers'], $matches);
-        $totalPages = isset($matches[1]) ? (int)$matches[1] : $page;
-
-        echo "Endpoint Pages - $totalPages pages found for {$endpoint} endpoint from site {$siteId}...\n";
-
-        if ($totalPages > 1) {
-            for ($page = 2; $page <= $totalPages; $page++) {
-                echo "Fetching {$endpoint} endpoint page {$page} from site {$siteId}...\n";
-                $currentPage = "&page={$page}";
-                $apiResponse = $this->fetchFromApi($apiURL . $currentPage);
-                $items = array_merge($items, $apiResponse['data']);
-            }
-        }
-
-        return $items;
-    }
-
-    /**
-     * Save raw content to S3 (or local if S3 not configured)
-     */
-    private function saveRawContent($item, $contentType, $siteId)
-    {
-        $rawContent = '';
-
-        $rawContent .= isset($item['title']['rendered'])
-                ? '<h1>' . $item['title']['rendered'] . '</h1>'
-                : 'Untitled';
-
-        $rawContent .= isset($item['content']['rendered'])
-                ? $item['content']['rendered']
-                : '';
-
-        $slug = isset($item['slug']) ? $item['slug'] : "{$contentType}-{$item['id']}";
-        $slug = preg_replace('/[^a-z0-9-_]/', '', strtolower($slug));
-        $filename = "{$slug}.txt";
-
-        // Upload to S3 or save locally
-        if ($this->s3Client) {
-            $s3Key = $this->s3Prefix . "site-{$siteId}/raw/{$contentType}/{$filename}";
-            $this->uploadToS3($rawContent, $s3Key);
-        } else {
-            // Fallback to local storage
-            $typeDir = "{$this->outputDir}/site-{$siteId}/raw/{$contentType}";
-            if (!is_dir($typeDir)) {
-                mkdir($typeDir, 0755, true);
-            }
-            $filePath = "{$typeDir}/{$filename}";
-            file_put_contents($filePath, $rawContent);
-            echo "Saved locally: {$filePath}\n";
-        }
-    }
-
-    /**
-     * Save content to S3 (or local if S3 not configured)
-     */
-    private function saveContent($items, $contentType, $siteId, $siteTaxonomies)
-    {
-        $contentTypeTaxonomies = [];
-
-        foreach ($siteTaxonomies as $taxonomy) {
-            if (in_array($contentType, $taxonomy['types'])) {
-                $contentTypeTaxonomies[] = $taxonomy;
-            }
-        }
-
-        foreach ($items as $item) {
-            $this->saveRawContent($item, $contentType, $siteId);
-
-            // Extract content
-            $title = isset($item['title']['rendered'])
-                ? $this->stripHtml($item['title']['rendered'])
-                : 'Untitled';
-
-            $content = isset($item['content']['rendered'])
-                ? $this->stripHtml($item['content']['rendered'])
-                : '';
-
-            $excerpt = isset($item['excerpt']['rendered'])
-                ? $this->stripHtml($item['excerpt']['rendered'])
-                : '';
-
-            $slug = isset($item['slug']) ? $item['slug'] : "{$contentType}-{$item['id']}";
-            $slug = preg_replace('/[^a-z0-9-_]/', '', strtolower($slug));
-            $filename = "{$slug}.txt";
-
-            // Combine content
-            $fullText = "Site ID: {$siteId}\n";
-            $fullText .= "Title: {$title}\n\n";
-
-            foreach ($contentTypeTaxonomies as $taxonomy) {
-                if (array_key_exists($taxonomy['slug'], $item) && !empty($item[$taxonomy['slug']])) {
-                    $term_names = [];
-                    $term_ids = $item[$taxonomy['slug']];
-
-                    foreach ($term_ids as $term_id) {
-                        if (array_key_exists($term_id, $taxonomy['terms'])) {
-                            $term_names[] = $taxonomy['terms'][$term_id]['name'];
-                        }
-                    }
-
-                    if (!empty($term_names)) {
-                        $fullText .= $taxonomy['name'] . ": \n\n";
-                        $fullText .= implode(", ", $term_names) . " \n\n";
-                    }
-                }
-            }
-
-            if (!empty($excerpt)) {
-                $fullText .= "Excerpt: {$excerpt}\n\n";
-            }
-
-            if (array_key_exists('post_meta', $item) && !empty($item['post_meta'])) {
-                if (array_key_exists('summary', $item['post_meta']) && !empty($item['post_meta']['summary'])) {
-                    $fullText .= "Summary: {$item['post_meta']['summary']}\n\n";
-                }
-            }
-
-            $fullText .= "Content:\n{$content}";
-
-            // Upload to S3 or save locally
-            if ($this->s3Client) {
-                $s3Key = $this->s3Prefix . "site-{$siteId}/clean/{$contentType}/{$filename}";
-                $this->uploadToS3($fullText, $s3Key);
-            } else {
-                // Fallback to local storage
-                $typeDir = "{$this->outputDir}/site-{$siteId}/clean/{$contentType}";
-                if (!is_dir($typeDir)) {
-                    mkdir($typeDir, 0755, true);
-                }
-                $filePath = "{$typeDir}/{$filename}";
-                file_put_contents($filePath, $fullText);
-                echo "Saved locally: {$filePath}\n";
-            }
-        }
-    }
-
-    /**
-     * Scrape a single site
-     */
-    private function scrapeSite($siteId, $baseURL = '')
-    {
-        $scrapeSummary = [];
-
-        echo "\n" . str_repeat("=", 60) . "\n";
-        echo "Processing Site ID: {$siteId}\n";
-        echo str_repeat("=", 60) . "\n\n";
-
-        $sitePostTypes = $this->getSitePostTypes($baseURL);
-        $siteTaxonomies = $this->getSiteTaxonomies($baseURL);
-
-        foreach ($sitePostTypes as $postType) {
-            $postTypeName = $postType['name'];
-            echo "=== Fetching {$postTypeName} from Site {$siteId} ===\n";
-
-            $items = $this->fetchAllItems($postType['rest_base'], $siteId, $baseURL);
-
-            echo "Total {$postTypeName} fetched: " . count($items) . "\n\n";
-
-            if (!empty($items)) {
-                echo "=== Saving {$postTypeName} from Site {$siteId} ===\n";
-                $this->saveContent($items, $postType['slug'], $siteId, $siteTaxonomies);
-            }
-
-            $scrapeSummary[] = [
-                'postTypeName' => $postType['name'],
-                'itemCount' => count($items)
-            ];
-        }
-
-        return $scrapeSummary;
-    }
-
-    /**
-     * Run the scraper for multiple sites
-     */
-    public function run($siteIds)
-    {
-        echo "Fetching content from: {$this->baseUrl}\n";
-        echo "Output directory: {$this->outputDir}\n";
-        echo "Target sites: " . implode(', ', $siteIds) . "\n";
-
-        $summary = [];
-
-        if ($this->env == 'PROD') {
-            $site_list = $this->getSiteList();
-
-            foreach ($site_list as $site) {
-                $siteId = (int) $site["blogID"];
-
-                if (in_array($siteId, $siteIds)) {
-                    $summary[$siteId] = $this->scrapeSite($siteId, $site["url"]);
-                }
-            }
-        } else {
-            foreach ($siteIds as $siteId) {
-                $summary[$siteId] = $this->scrapeSite($siteId);
-            }
-        }
-
-        // Print summary
-        echo "\n" . str_repeat("=", 60) . "\n";
-        echo "SCRAPING COMPLETE - SUMMARY\n";
-        echo str_repeat("=", 60) . "\n";
-
-        foreach ($summary as $siteId => $siteSummary) {
-            $summaryText = "Site {$siteId}: ";
-            $count = 0;
-            foreach ($siteSummary as $postType) {
-                if ($count > 0) {
-                    $summaryText .= ", ";
-                }
-                $summaryText .= $postType['itemCount'] . " " . $postType['postTypeName'];
-                $count++;
-            }
-            echo $summaryText . "\n";
-        }
-
-        if ($this->s3Client) {
-            echo "\nFiles uploaded to: s3://{$this->s3Bucket}/{$this->s3Prefix}\n";
-        } else {
-            echo "\nFiles saved locally to: {$this->outputDir}\n";
-        }
+        return trim($text);
     }
 
     private function fetchFromApi($apiURL)
     {
-        $apiResponse = ['data' => [], 'headers' => ''];
-        $ch = curl_init();
+        echo "Chunk: Fetching URL: $apiURL\n";
 
+        $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $apiURL);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true); // set false temporarily if SSL fails
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
         curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
         curl_setopt($ch, CURLOPT_HEADER, true);
 
         $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
 
         if (curl_errno($ch)) {
-            echo "cURL Error Number: " . curl_errno($ch) . "\n";
-            echo "cURL Error Message: " . curl_error($ch) . "\n";
-            $data = null;
-        } else {
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            echo "cURL Error: " . curl_error($ch) . "\n";
+            curl_close($ch);
+            return ['data' => [], 'headers' => ''];
+        }
 
-            if ($httpCode === 200) {
-                $headers = substr($response, 0, $headerSize);
-                $body = substr($response, $headerSize);
-                $apiResponse['headers'] = $headers;
-                $data = json_decode($body, true);
+        $headers = substr($response, 0, $headerSize);
+        $body = substr($response, $headerSize);
 
-                if (json_last_error() !== JSON_ERROR_NONE) {
-                    echo "JSON Decode Error: " . json_last_error_msg() . "\n";
-                    $data = null;
-                }
-            } else {
-                echo "HTTP Error: Received status code $httpCode\n";
-                $data = null;
-            }
+        if ($httpCode !== 200) {
+            echo "HTTP Error: $httpCode for URL: $apiURL\n";
+            curl_close($ch);
+            return ['data' => [], 'headers' => $headers];
+        }
+
+        $data = json_decode($body, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            echo "JSON Decode Error: " . json_last_error_msg() . "\n";
+            $data = [];
         }
 
         curl_close($ch);
-
-        if ($data !== null) {
-            $apiResponse['data'] = $data;
-        }
-
-        return $apiResponse;
+        return ['data' => $data, 'headers' => $headers];
     }
 
-    private function getSiteTaxonomies($baseURL = '')
+    private function fetchAllItems($endpoint, $siteId, $baseURL = '')
     {
-        $siteTaxonomies = [];
-        $apiURL = $baseURL . '/wp-json/wp/v2/taxonomies';
-        $apiResponse = $this->fetchFromApi($apiURL);
-        $fetchedTaxonomies = $apiResponse['data'];
+        $items = [];
+        $page = 1;
+        $perPage = 100;
+        $effectiveBaseURL = !empty($baseURL) ? $baseURL : $this->baseUrl;
 
-        $excludedTaxonomies = ['nav_menu', 'wp_pattern_category'];
+        $apiURL = $siteId === 1
+            ? "{$effectiveBaseURL}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}"
+            : "{$effectiveBaseURL}/site-{$siteId}/wp-json/wp/v2/{$endpoint}?per_page={$perPage}";
 
-        foreach ($fetchedTaxonomies as $taxonomy) {
-            if (!in_array($taxonomy['slug'], $excludedTaxonomies)) {
-                $terms = [];
-                $apiURL = $baseURL . '/wp-json/wp/v2/' . $taxonomy['rest_base'];
-                $apiResponse = $this->fetchFromApi($apiURL);
-                $fetchedTerms = $apiResponse['data'];
+        do {
+            $currentPage = "&page={$page}";
+            $response = $this->fetchFromApi($apiURL . $currentPage);
 
-                foreach ($fetchedTerms as $term) {
-                    $terms[$term['id']] = $term;
-                }
+            $fetched = $response['data'] ?? [];
+            echo "Chunk: Fetched " . count($fetched) . " items from page {$page} of endpoint {$endpoint}\n";
 
-                $taxonomy['terms'] = $terms;
-                $siteTaxonomies[] = $taxonomy;
+            if (!empty($fetched)) {
+                $items = array_merge($items, $fetched);
+            } else {
+                echo "Chunk: No items returned for page {$page}\n";
+            }
+
+            preg_match('/X-WP-TotalPages: (\d+)/i', $response['headers'], $matches);
+            $totalPages = isset($matches[1]) ? (int)$matches[1] : $page;
+
+            $page++;
+        } while ($page <= $totalPages);
+
+        echo "Chunk: Total items fetched for {$endpoint}: " . count($items) . "\n";
+        return $items;
+    }
+
+    private function saveRawContent($item, $contentType, $siteId)
+    {
+        $rawContent = '';
+        $rawContent .= $item['title']['rendered'] ?? 'Untitled';
+        $rawContent .= "\n";
+        $rawContent .= $item['content']['rendered'] ?? '';
+
+        $slug = strtolower(preg_replace('/[^a-z0-9-_]/', '', $item['slug'] ?? "{$contentType}-{$item['id']}"));
+        $filename = "{$slug}.txt";
+
+        if ($this->s3Client) {
+            $s3Key = $this->s3Prefix . "site-{$siteId}/raw/{$contentType}/{$filename}";
+            echo "Chunk: Uploading raw content of length " . strlen($rawContent) . " to S3 key: {$s3Key}\n";
+            $this->uploadToS3($rawContent, $s3Key);
+        }
+    }
+
+    private function saveContent($items, $contentType, $siteId, $siteTaxonomies)
+    {
+        foreach ($items as $item) {
+            $this->saveRawContent($item, $contentType, $siteId);
+
+            $title = $this->stripHtml($item['title']['rendered'] ?? '');
+            $content = $this->stripHtml($item['content']['rendered'] ?? '');
+            $excerpt = $this->stripHtml($item['excerpt']['rendered'] ?? '');
+
+            $slug = strtolower(preg_replace('/[^a-z0-9-_]/', '', $item['slug'] ?? "{$contentType}-{$item['id']}"));
+            $filename = "{$slug}.txt";
+
+            $fullText = "Site ID: {$siteId}\nTitle: {$title}\n\nExcerpt: {$excerpt}\n\nContent:\n{$content}";
+            if ($this->s3Client) {
+                $s3Key = $this->s3Prefix . "site-{$siteId}/clean/{$contentType}/{$filename}";
+                echo "Chunk: Uploading full content of length " . strlen($fullText) . " to S3 key: {$s3Key}\n";
+                $this->uploadToS3($fullText, $s3Key);
             }
         }
+    }
 
-        return $siteTaxonomies;
+    private function scrapeSite($siteId, $baseURL = '')
+    {
+        echo "\n=== Processing Site ID: {$siteId} ===\n";
+
+        $sitePostTypes = $this->getSitePostTypes($baseURL);
+        $siteTaxonomies = $this->getSiteTaxonomies($baseURL);
+
+        foreach ($sitePostTypes as $postType) {
+            echo "--- Fetching {$postType['name']} ---\n";
+            $items = $this->fetchAllItems($postType['rest_base'], $siteId, $baseURL);
+
+            if (!empty($items)) {
+                echo "--- Saving {$postType['name']} ---\n";
+                $this->saveContent($items, $postType['slug'], $siteId, $siteTaxonomies);
+            } else {
+                echo "Chunk: No items to save for {$postType['slug']}\n";
+            }
+        }
+    }
+
+    public function run($siteIds)
+    {
+        echo "\n=== WordPress Content Scraper ===\n";
+        echo "Base URL: {$this->baseUrl}\n";
+        echo "Target sites: " . implode(', ', $siteIds) . "\n";
+
+        foreach ($siteIds as $siteId) {
+            $this->scrapeSite($siteId);
+        }
+
+        echo "\n✓ Scraping complete.\n";
+
+        if ($this->s3Client) {
+            echo "✓ Files uploaded to: s3://{$this->s3Bucket}/{$this->s3Prefix}\n";
+            if (!empty($this->uploadFailures)) {
+                echo "⚠️  Upload failures:\n";
+                foreach ($this->uploadFailures as $key) {
+                    echo "  - {$key}\n";
+                }
+            }
+        }
     }
 
     private function getSitePostTypes($baseURL = '')
     {
-        $postTypes = [];
-        $apiURL = $baseURL . '/wp-json/wp/v2/types';
-        $apiResponse = $this->fetchFromApi($apiURL);
-        $fetchedPostTypes = $apiResponse['data'];
-
-        $excludedPostTypes = [
-            'attachment', 'nav_menu_item', 'wp_block', 'wp_template',
-            'wp_template_part', 'wp_global_styles', 'wp_navigation',
-            'wp_font_family', 'wp_font_face'
-        ];
-
-        foreach ($fetchedPostTypes as $postType) {
-            if (!in_array($postType['slug'], $excludedPostTypes)) {
-                $postTypes[] = $postType;
-            }
-        }
-
-        return $postTypes;
+        $apiURL = (!empty($baseURL) ? rtrim($baseURL, '/') : $this->baseUrl) . '/wp-json/wp/v2/types';
+        $response = $this->fetchFromApi($apiURL);
+        return array_filter($response['data'] ?? [], fn ($pt) => !in_array($pt['slug'], [
+            'attachment','nav_menu_item','wp_block','wp_template',
+            'wp_template_part','wp_global_styles','wp_navigation',
+            'wp_font_family','wp_font_face'
+        ]));
     }
 
-    private function getSiteList()
+    private function getSiteTaxonomies($baseURL = '')
     {
-        $apiURL = 'https://websitebuilder.service.justice.gov.uk/wp-json/hc-rest/v1/sites/domain';
-        $apiResponse = $this->fetchFromApi($apiURL);
-        return $apiResponse['data'];
+        $apiURL = (!empty($baseURL) ? rtrim($baseURL, '/') : $this->baseUrl) . '/wp-json/wp/v2/taxonomies';
+        $response = $this->fetchFromApi($apiURL);
+        return $response['data'] ?? [];
     }
 }
 
-// Main execution
+// --------------------------------------------
+// MAIN EXECUTION
+// --------------------------------------------
 if (php_sapi_name() !== 'cli') {
-    die("This script must be run from the command line.\n");
+    die("Must run from CLI.\n");
 }
 
-// Configure S3 (set to null to disable S3 and use local storage)
-$s3Config = [
+$s3Config = ($ENV !== 'local') ? [
     'bucket' => $S3_BUCKET,
     'region' => $S3_REGION,
-    'prefix' => $S3_PREFIX,
-];
+    'prefix' => $S3_PREFIX
+] : null;
 
-// Run scraper
 $scraper = new WordPressMultisiteScraper($BASE_URL, $OUTPUT_DIR, $ENV, $s3Config);
 $scraper->run($SITE_IDS);

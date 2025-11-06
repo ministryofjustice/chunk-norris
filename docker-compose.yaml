@@ -1,9 +1,0 @@
-services:
-  data_etl_tool:
-    build: .
-    container_name: cn_data_etl
-    volumes:
-      - ./scraper:/app:cached
-    working_dir: /app
-    command: php run.php
-

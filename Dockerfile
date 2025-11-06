@@ -1,13 +1,18 @@
 FROM php:latest
 
-# Install system dependencies
+# Install system dependencies and AWS CLI v2
 RUN apt-get update && apt-get install -y \
     git \
     unzip \
     libzip-dev \
     curl \
+    less \
+    groff \
  && docker-php-ext-install zip \
- && rm -rf /var/lib/apt/lists/*
+ && curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "awscliv2.zip" \
+ && unzip awscliv2.zip \
+ && ./aws/install \
+ && rm -rf awscliv2.zip aws/ /var/lib/apt/lists/*
 
 # Install Composer globally
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
@@ -30,3 +35,4 @@ USER 1000
 
 # Default command
 CMD ["php", "/app/run.php"]
+

@@ -5,7 +5,7 @@ metadata:
   namespace: website-builder-assistant-dev
 spec:
   schedule: "0 */1 * * *" # Run every hour
-  successfulJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 2
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
@@ -25,9 +25,9 @@ spec:
                 - name: SITE_IDS
                   value: "1"
                 - name: OUTPUT_DIR
-                  value: "wordpress_content"
+                  value: "wordpress-content"
                 - name: ENV
-                  value: "PROD"
+                  value: "prod"
                 
                 # S3 Configuration
                 - name: S3_BUCKET
