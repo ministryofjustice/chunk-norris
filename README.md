@@ -66,3 +66,8 @@ Switch into the namespace and run `make deploy`. This will setup the cronjob in 
 Manually trigger cron
 Run `make trigger` . Watch pods and it will appear.
 
+## How do images fit into all this?
+Any push to the `main` branch of this repo will trigger a Docker image build of this app that then is pushed into its own
+repo in the website-builder-assistant-dev namespace. When you deploy your k8s manifest it will then grab this image you've put into the
+namespace. It is set to always update the latest image.
+
