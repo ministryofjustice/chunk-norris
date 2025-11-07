@@ -13,7 +13,8 @@ It focuses on:
 
 Once deployed into the cluster it is set on a cron to run every hour. Every hour it will target the 
 https://websitebuilder.service.justice.gov.uk site scraping all the post and pages via the WP API, clean that data
-and output it into the s3://cloud-platform-69f5cec4ef010c4aa8746dab4cda322a/wordpress-content/ bucket.
+and output it into the `s3://cloud-platform-69f5cec4ef010c4aa8746dab4cda322a/wordpress-content/` bucket. It creates two sets
+of folders within this, one with raw uncleaned data an one with cleaned data.
 
 ---
 
