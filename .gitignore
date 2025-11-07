@@ -101,8 +101,16 @@ logs/
 *.html
 *.parquet
 
+# -------------------------
+# Environment / secrets
+# -------------------------
+.env
+.env.local
+.env.*.local
+
 # =====================================================
 # Folders
 # =====================================================
 
 scraper/wordpress_content/
+output/

@@ -1,0 +1,13 @@
+services:
+  chunk-norris:
+    image: chunk-norris:latest
+    container_name: chunk-roundhouse-to-data
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/wordpress-content
+    stdin_open: true
+    tty: true
+    extra_hosts:
+      - "hale.docker:host-gateway"
+

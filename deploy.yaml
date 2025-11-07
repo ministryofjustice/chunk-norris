@@ -1,0 +1,56 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: chunk-norris-cron
+  namespace: website-builder-assistant-dev
+spec:
+  schedule: "0 */1 * * *" # Run every hour
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 3  # Retry limit - correct placement
+      template:
+        spec:
+          serviceAccountName: website-builder-assistant-dev-service
+          restartPolicy: OnFailure
+          containers:
+            - name: chunk-norris-cron
+              image: 754256621582.dkr.ecr.eu-west-2.amazonaws.com/jotw-content-devs/website-builder-assistant-dev-chunk-norris-ecr:latest
+              imagePullPolicy: Always
+              env:
+                # WordPress API Configuration
+                - name: PUBLIC_BASE_URL
+                  value: "https://websitebuilder.service.justice.gov.uk"
+                - name: SITE_IDS
+                  value: "1"
+                - name: OUTPUT_DIR
+                  value: "wordpress-content"
+                - name: ENV
+                  value: "prod"
+                
+                # S3 Configuration
+                - name: S3_BUCKET
+                  value: "cloud-platform-69f5cec4ef010c4aa8746dab4cda322a"
+                - name: S3_REGION
+                  value: "eu-west-2"
+                - name: S3_PREFIX
+                  value: "wordpress-content/"
+              
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "500m"
+              
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+                runAsNonRoot: true
+                runAsUser: 1000
+                seccompProfile:
+                  type: RuntimeDefault
