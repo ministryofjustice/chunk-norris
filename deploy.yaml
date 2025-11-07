@@ -5,11 +5,11 @@ metadata:
   namespace: website-builder-assistant-dev
 spec:
   schedule: "0 */1 * * *" # Run every hour
-  successfulJobsHistoryLimit: 2
+  successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      backoffLimit: 3  # Retry limit - correct placement
+      backoffLimit: 3  # Retry limit
       template:
         spec:
           serviceAccountName: website-builder-assistant-dev-service
